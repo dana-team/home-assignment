@@ -1,9 +1,10 @@
 apiVersion: dana.dana.io/v1alpha1
 kind: NamespaceLabel
 metadata:
-  labels:
-    app.kubernetes.io/name: namespacelabel-assignment
-    app.kubernetes.io/managed-by: kustomize
   name: namespacelabel-sample
+  namespace: default
 spec:
-  # TODO(user): Add fields here
+  labels:
+    label_1: a
+    label_2: b
+    label_3: c
