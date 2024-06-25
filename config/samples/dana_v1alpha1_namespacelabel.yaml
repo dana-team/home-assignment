@@ -7,4 +7,5 @@ spec:
   labels:
     label_1: a
     label_2: b
-    label_3: c
+    label_3: d
+    label_4: d
