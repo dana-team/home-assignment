@@ -42,9 +42,8 @@ type NamespaceLabelReconciler struct {
 }
 
 const (
-	finalizerName           = "namespacelabel.finalizers.dana.io/finalizer"
-	managementLabelPrefix   = "app.kubernetes.io"
-	annotationDeleteCleanup = "namespacelabel.dana.io/deletion-cleanup"
+	finalizerName         = "namespacelabel.finalizers.dana.io/finalizer"
+	managementLabelPrefix = "app.kubernetes.io"
 )
 
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels,verbs=get;list;watch;create;update;patch;delete
@@ -96,15 +95,12 @@ func (r *NamespaceLabelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	// Reconcile the namespace labels
-	if err := r.reconcileNamespaceLabels(ctx, req.Namespace, namespaceLabel, ns); err != nil {
+	if err := r.reconcileNamespaceLabels(ctx, namespaceLabel, ns); err != nil {
 		r.updateStatus(ctx, namespaceLabel, "UpdateFailed", metav1.ConditionFalse, "UpdateError", err.Error())
 		return ctrl.Result{}, err
 	}
 
 	r.updateStatus(ctx, namespaceLabel, "LabelsApplied", metav1.ConditionTrue, "Success", "Namespace labels have been successfully updated")
-	if err := r.Status().Update(ctx, namespaceLabel); err != nil {
-		return ctrl.Result{}, err
-	}
 
 	return ctrl.Result{}, nil
 }
@@ -127,33 +123,21 @@ func (r *NamespaceLabelReconciler) handleDeletion(
 	return ctrl.Result{}, nil
 }
 
-func extractUnmanagedLabels(namespaceLabel *danav1alpha1.NamespaceLabel) map[string]string {
-	unmanagedLabels := make(map[string]string)
-	for key, value := range namespaceLabel.Spec.Labels {
-		if !isManagementLabel(key) {
-			unmanagedLabels[key] = value
-		}
-	}
-	return unmanagedLabels
-}
-
 func isManagementLabel(label string) bool {
 	return strings.HasPrefix(label, managementLabelPrefix)
 }
 
 func (r *NamespaceLabelReconciler) reconcileNamespaceLabels(
-	ctx context.Context, namespace string, namespaceLabel *danav1alpha1.NamespaceLabel, ns *corev1.Namespace) error {
-	// Ensure labels are not protected or management labels
-	labelsToUpdate := make(map[string]string)
-	for key, value := range namespaceLabel.Spec.Labels {
+	ctx context.Context, namespaceLabel *danav1alpha1.NamespaceLabel, ns *corev1.Namespace) error {
+	// Ensure labels are not management labels
+	for key := range namespaceLabel.Spec.Labels {
 		if isManagementLabel(key) {
 			return fmt.Errorf("cannot add protected or management label '%s'", key)
 		}
-		labelsToUpdate[key] = value
 	}
 
 	// Apply labels from NamespaceLabel to Namespace
-	for key, value := range labelsToUpdate {
+	for key, value := range namespaceLabel.Spec.Labels {
 		ns.Labels[key] = value
 	}
 
@@ -162,8 +146,6 @@ func (r *NamespaceLabelReconciler) reconcileNamespaceLabels(
 		return err
 	}
 
-	// Update status with applied labels
-	r.updateStatus(ctx, namespaceLabel, "LabelsApplied", metav1.ConditionTrue, "Success", "Namespace labels have been successfully updated")
 	return nil
 }
 
@@ -177,7 +159,7 @@ func (r *NamespaceLabelReconciler) updateStatus(ctx context.Context, namespaceLa
 	}
 
 	// Update or append condition
-	namespaceLabel.Status.Conditions = appendOrUpdateCondition(namespaceLabel.Status.Conditions, condition)
+	namespaceLabel.Status.Conditions = updateNewCondition(namespaceLabel.Status.Conditions, condition)
 
 	// Update status
 	if err := r.Status().Update(ctx, namespaceLabel); err != nil {
@@ -185,11 +167,11 @@ func (r *NamespaceLabelReconciler) updateStatus(ctx context.Context, namespaceLa
 	}
 }
 
-// appendOrUpdateCondition appends a new condition or updates an existing one in the slice of conditions
-func appendOrUpdateCondition(conditions []metav1.Condition, newCondition metav1.Condition) []metav1.Condition {
-	for i, cond := range conditions {
-		if cond.Type == newCondition.Type {
-			conditions[i] = newCondition
+// updateNewCondition appends a new condition or updates an existing one in the slice of conditions
+func updateNewCondition(conditions []metav1.Condition, newCondition metav1.Condition) []metav1.Condition {
+	for index := range conditions {
+		if conditions[index].Type == newCondition.Type {
+			conditions[index] = newCondition
 			return conditions
 		}
 	}

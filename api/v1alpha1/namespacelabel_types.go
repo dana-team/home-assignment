@@ -25,7 +25,6 @@ type NamespaceLabelSpec struct {
 	// Labels to be added to the Namespace
 	// +kubebuilder:validation:Optional
 	// +kubebuilder:validation:Type=object
-	// +kubebuilder:validation:UniqueItems=true
 	Labels map[string]string `json:"labels,omitempty"`
 }
 
