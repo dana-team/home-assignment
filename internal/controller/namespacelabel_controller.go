@@ -17,103 +17,183 @@ limitations under the License.
 package controller
 
 import (
-    "context"
-    "fmt"
-	"path"
+	"context"
+	"fmt"
+	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-    corev1 "k8s.io/api/core/v1"
-    "k8s.io/apimachinery/pkg/api/errors"
-    "k8s.io/apimachinery/pkg/types"
-    "sigs.k8s.io/controller-runtime/pkg/client"
-    // "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 
-    danav1alpha1 "github.com/TalDebi/namespacelabel-assignment.git/api/v1alpha1"
+	danav1alpha1 "github.com/TalDebi/namespacelabel-assignment.git/api/v1alpha1"
+	"github.com/go-logr/logr"
 )
 
 // NamespaceLabelReconciler reconciles a NamespaceLabel object
 type NamespaceLabelReconciler struct {
 	client.Client
+	Log    logr.Logger
 	Scheme *runtime.Scheme
 }
+
+const (
+	finalizerName           = "namespacelabel.finalizers.dana.io/finalizer"
+	managementLabelPrefix   = "app.kubernetes.io"
+	annotationDeleteCleanup = "namespacelabel.dana.io/deletion-cleanup"
+)
 
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels/finalizers,verbs=update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
-// TODO(user): Modify the Reconcile function to compare the state specified by
-// the NamespaceLabel object against the actual cluster state, and then
-// perform operations to make the cluster state reflect the state specified by
-// the user.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.18.2/pkg/reconcile
 func (r *NamespaceLabelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	// log := log.Log.WithValues("namespacelabel", req.NamespacedName)
+	_ = context.Background()
+	_ = log.FromContext(ctx)
 
 	// Fetch the NamespaceLabel instance
-	var namespaceLabel danav1alpha1.NamespaceLabel
-	if err := r.Get(ctx, req.NamespacedName, &namespaceLabel); err != nil {
-		if errors.IsNotFound(err) {
-			// Handle deletion
-			return ctrl.Result{}, nil
+	namespaceLabel := &danav1alpha1.NamespaceLabel{}
+	if err := r.Get(ctx, req.NamespacedName, namespaceLabel); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Fetch the Namespace instance
+	ns := &corev1.Namespace{}
+	if err := r.Get(ctx, types.NamespacedName{Name: req.Namespace}, ns); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Handle deletion
+	if namespaceLabel.ObjectMeta.DeletionTimestamp.IsZero() {
+		if !controllerutil.ContainsFinalizer(namespaceLabel, finalizerName) {
+			controllerutil.AddFinalizer(namespaceLabel, finalizerName)
+			if err := r.Update(ctx, namespaceLabel); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
-		return ctrl.Result{}, err
+	} else {
+		if controllerutil.ContainsFinalizer(namespaceLabel, finalizerName) {
+			r.handleDeletion(ctx, namespaceLabel, ns)
+		}
+
+		return ctrl.Result{}, nil
 	}
 
 	// Ensure only one NamespaceLabel per namespace
-	existingLabels := &danav1alpha1.NamespaceLabelList{}
-	if err := r.List(ctx, existingLabels, client.InNamespace(req.Namespace)); err != nil {
-		return ctrl.Result{}, err
-	}
-	if len(existingLabels.Items) > 1 {
-		return ctrl.Result{}, fmt.Errorf("only one NamespaceLabel allowed per namespace")
-	}
-
-	// Fetch the namespace
-	var namespace corev1.Namespace
-	if err := r.Get(ctx, types.NamespacedName{Name: req.Namespace}, &namespace); err != nil {
+	existingNamespaceLabels := &danav1alpha1.NamespaceLabelList{}
+	if err := r.List(ctx, existingNamespaceLabels, client.InNamespace(req.Namespace)); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// Protect existing labels
-	protectedLabels := []string{"kubernetes.io/*", "mycompany.com/protected"}
-	labelsToUpdate := filterLabels(namespaceLabel.Spec.Labels, protectedLabels)
+	if len(existingNamespaceLabels.Items) > 1 {
+		var err = fmt.Errorf("only one NamespaceLabel allowed per namespace")
+		r.updateStatus(ctx, namespaceLabel, "NamespaceLabelsConflict", metav1.ConditionFalse, "Conflict", err.Error())
+		return ctrl.Result{}, err
+	}
 
-	// Update namespace labels
-	namespace.Labels = mergeLabels(namespace.Labels, labelsToUpdate)
-	if err := r.Update(ctx, &namespace); err != nil {
+	// Reconcile the namespace labels
+	if err := r.reconcileNamespaceLabels(ctx, req.Namespace, namespaceLabel, ns); err != nil {
+		r.updateStatus(ctx, namespaceLabel, "UpdateFailed", metav1.ConditionFalse, "UpdateError", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	r.updateStatus(ctx, namespaceLabel, "LabelsApplied", metav1.ConditionTrue, "Success", "Namespace labels have been successfully updated")
+	if err := r.Status().Update(ctx, namespaceLabel); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
 }
 
-func filterLabels(labels map[string]string, protected []string) map[string]string {
-    filtered := make(map[string]string)
-    for key, value := range labels {
-        isProtected := false
-        for _, p := range protected {
-            if matched, _ := path.Match(p, key); matched {
-                isProtected = true
-                break
-            }
-        }
-        if !isProtected {
-            filtered[key] = value
-        }
-    }
-    return filtered
+func (r *NamespaceLabelReconciler) handleDeletion(
+	ctx context.Context, namespaceLabel *danav1alpha1.NamespaceLabel, ns *corev1.Namespace) (ctrl.Result, error) {
+	// Remove labels managed by this NamespaceLabel
+	for key := range namespaceLabel.Spec.Labels {
+		delete(ns.Labels, key)
+	}
+	if err := r.Update(ctx, ns); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(namespaceLabel, finalizerName)
+	if err := r.Update(ctx, namespaceLabel); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
 }
 
-func mergeLabels(existing, updates map[string]string) map[string]string {
-    for key, value := range updates {
-        existing[key] = value
-    }
-    return existing
+func extractUnmanagedLabels(namespaceLabel *danav1alpha1.NamespaceLabel) map[string]string {
+	unmanagedLabels := make(map[string]string)
+	for key, value := range namespaceLabel.Spec.Labels {
+		if !isManagementLabel(key) {
+			unmanagedLabels[key] = value
+		}
+	}
+	return unmanagedLabels
+}
+
+func isManagementLabel(label string) bool {
+	return strings.HasPrefix(label, managementLabelPrefix)
+}
+
+func (r *NamespaceLabelReconciler) reconcileNamespaceLabels(
+	ctx context.Context, namespace string, namespaceLabel *danav1alpha1.NamespaceLabel, ns *corev1.Namespace) error {
+	// Ensure labels are not protected or management labels
+	labelsToUpdate := make(map[string]string)
+	for key, value := range namespaceLabel.Spec.Labels {
+		if isManagementLabel(key) {
+			return fmt.Errorf("cannot add protected or management label '%s'", key)
+		}
+		labelsToUpdate[key] = value
+	}
+
+	// Apply labels from NamespaceLabel to Namespace
+	for key, value := range labelsToUpdate {
+		ns.Labels[key] = value
+	}
+
+	// Update Namespace with new labels
+	if err := r.Update(ctx, ns); err != nil {
+		return err
+	}
+
+	// Update status with applied labels
+	r.updateStatus(ctx, namespaceLabel, "LabelsApplied", metav1.ConditionTrue, "Success", "Namespace labels have been successfully updated")
+	return nil
+}
+
+func (r *NamespaceLabelReconciler) updateStatus(ctx context.Context, namespaceLabel *danav1alpha1.NamespaceLabel, conditionType string, status metav1.ConditionStatus, reason, message string) {
+	condition := metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		LastTransitionTime: metav1.Now(),
+		Reason:             reason,
+		Message:            message,
+	}
+
+	// Update or append condition
+	namespaceLabel.Status.Conditions = appendOrUpdateCondition(namespaceLabel.Status.Conditions, condition)
+
+	// Update status
+	if err := r.Status().Update(ctx, namespaceLabel); err != nil {
+		r.Log.Error(err, "Failed to update NamespaceLabel status")
+	}
+}
+
+// appendOrUpdateCondition appends a new condition or updates an existing one in the slice of conditions
+func appendOrUpdateCondition(conditions []metav1.Condition, newCondition metav1.Condition) []metav1.Condition {
+	for i, cond := range conditions {
+		if cond.Type == newCondition.Type {
+			conditions[i] = newCondition
+			return conditions
+		}
+	}
+	return append(conditions, newCondition)
 }
 
 // SetupWithManager sets up the controller with the Manager.
