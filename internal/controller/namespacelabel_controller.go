@@ -46,13 +46,23 @@ const (
 	managementLabelPrefix = "app.kubernetes.io"
 )
 
+//manager
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels/finalizers,verbs=update
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+//tenants
+// +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=dana.dana.io,resources=namespacelabels/finalizers,verbs=update
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 func (r *NamespaceLabelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = context.Background()
-	_ = log.FromContext(ctx)
+	log := log.FromContext(ctx)
+
+	log.Info("Starting reconciliation for NamespaceLabel", "Namespace", req.Namespace, "Name", req.Name)
 
 	// Fetch the NamespaceLabel instance
 	namespaceLabel := &danav1alpha1.NamespaceLabel{}
@@ -60,11 +70,29 @@ func (r *NamespaceLabelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	log.Info("Fetched NamespaceLabel", "NamespaceLabel", namespaceLabel)
+
 	// Fetch the Namespace instance
 	ns := &corev1.Namespace{}
 	if err := r.Get(ctx, types.NamespacedName{Name: req.Namespace}, ns); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	// Ensure only one NamespaceLabel per namespace
+	existingNamespaceLabels := &danav1alpha1.NamespaceLabelList{}
+	if err := r.List(ctx, existingNamespaceLabels, client.InNamespace(req.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Existing NamespaceLabels", "Count", len(existingNamespaceLabels.Items))
+
+	if len(existingNamespaceLabels.Items) > 1 {
+		var err = fmt.Errorf("only one NamespaceLabel allowed per namespace")
+		r.updateStatus(ctx, namespaceLabel, "NamespaceLabelsConflict", metav1.ConditionFalse, "Conflict", err.Error())
+		return ctrl.Result{}, err
+	}
+
+	log.Info("Creating nsl")
 
 	// Handle deletion
 	if namespaceLabel.ObjectMeta.DeletionTimestamp.IsZero() {
@@ -80,18 +108,6 @@ func (r *NamespaceLabelReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 
 		return ctrl.Result{}, nil
-	}
-
-	// Ensure only one NamespaceLabel per namespace
-	existingNamespaceLabels := &danav1alpha1.NamespaceLabelList{}
-	if err := r.List(ctx, existingNamespaceLabels, client.InNamespace(req.Namespace)); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if len(existingNamespaceLabels.Items) > 1 {
-		var err = fmt.Errorf("only one NamespaceLabel allowed per namespace")
-		r.updateStatus(ctx, namespaceLabel, "NamespaceLabelsConflict", metav1.ConditionFalse, "Conflict", err.Error())
-		return ctrl.Result{}, err
 	}
 
 	// Reconcile the namespace labels
@@ -129,15 +145,37 @@ func isManagementLabel(label string) bool {
 
 func (r *NamespaceLabelReconciler) reconcileNamespaceLabels(
 	ctx context.Context, namespaceLabel *danav1alpha1.NamespaceLabel, ns *corev1.Namespace) error {
+
+	// Track labels to be added and removed
+	labelsToAdd := make(map[string]string)
+	labelsToRemove := make(map[string]struct{})
+
+	// Collect labels to add or update
+	for key, value := range namespaceLabel.Spec.Labels {
+		labelsToAdd[key] = value
+	}
+
 	// Ensure labels are not management labels
-	for key := range namespaceLabel.Spec.Labels {
+	for key := range labelsToAdd {
 		if isManagementLabel(key) {
 			return fmt.Errorf("cannot add protected or management label '%s'", key)
 		}
 	}
 
-	// Apply labels from NamespaceLabel to Namespace
-	for key, value := range namespaceLabel.Spec.Labels {
+	// Collect labels to remove
+	for key := range ns.Labels {
+		if _, exists := labelsToAdd[key]; !exists && !isManagementLabel(key) {
+			labelsToRemove[key] = struct{}{}
+		}
+	}
+
+	// Remove labels that are no longer present in NamespaceLabel
+	for key := range labelsToRemove {
+		delete(ns.Labels, key)
+	}
+
+	// Apply labels to be added or updated
+	for key, value := range labelsToAdd {
 		ns.Labels[key] = value
 	}
 

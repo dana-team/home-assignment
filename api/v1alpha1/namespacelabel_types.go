@@ -40,9 +40,10 @@ type NamespaceLabelStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:shortName=nsl
+// +kubebuilder:printcolumn:name="Labels",type="string",JSONPath=".spec.labels",description="Labels applied to the Namespace"
 
 // NamespaceLabel is the Schema for the namespacelabels API
-// +kubebuilder:printcolumn:name="Labels",type="string",JSONPath=".spec.labels",description="Labels applied to the Namespace"
 type NamespaceLabel struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
